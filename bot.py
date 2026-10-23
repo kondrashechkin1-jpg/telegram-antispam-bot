@@ -1,15 +1,22 @@
 """Telegram anti-spam moderation with PostgreSQL and age-based penalties."""
 import asyncio
+import hashlib
 import html
+import json
 import logging
 import os
 import re
+import time
+import uuid
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 import asyncpg
-from telegram import ChatPermissions, Update
+from telegram import ChatPermissions, Update, __version__ as PTB_VERSION
 from telegram.constants import ChatMemberStatus, ParseMode
-from telegram.ext import ApplicationBuilder, ChatMemberHandler, ContextTypes, MessageHandler, filters
+from telegram.error import Conflict
+from telegram.ext import ApplicationBuilder, ChatMemberHandler, ContextTypes, MessageHandler, TypeHandler, filters
+from telegram.request import HTTPXRequest
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
 logging.getLogger('httpx').setLevel(logging.WARNING)
@@ -20,9 +27,88 @@ DATABASE_URL = os.environ['DATABASE_URL']
 ALLOWED_CHAT_ID = int(os.environ['ALLOWED_CHAT_ID'])
 DRY_RUN = os.getenv('DRY_RUN', 'true').strip().lower() != 'false'
 TEST_ADMINS = os.getenv('TEST_ADMINS', 'false').strip().lower() == 'true'
+# Test-only override, scoped to one user AND the dedicated test chat.
+TEST_FORCE_REGULAR = os.getenv('TEST_FORCE_REGULAR', 'false').strip().lower() == 'true'
+TEST_FORCE_REGULAR_USER_ID = int(os.getenv('TEST_FORCE_REGULAR_USER_ID', '0'))
+TEST_FORCE_REGULAR_CHAT_ID = int(os.getenv('TEST_FORCE_REGULAR_CHAT_ID', '0'))
 NOTICE_TTL_SECONDS = 60
 NEWCOMER_HOURS = 24
 MUTE_HOURS = 48
+
+# Diagnostics only. No extra getUpdates calls and no message text/token logging.
+DIAG_BUILD = 'diag-2026-10-24-01'
+DIAG_INSTANCE = uuid.uuid4().hex[:8]
+DIAG_STARTED = time.monotonic()
+DIAG_STATE = {'poll_ok': 0, 'poll_errors': 0, 'received': 0, 'conflicts': 0}
+
+
+class DiagnosticRequest(HTTPXRequest):
+    """Observe the existing polling request; never start a second poller."""
+
+    async def do_request(self, *args, **kwargs):
+        started = time.monotonic()
+        try:
+            status, payload = await super().do_request(*args, **kwargs)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            DIAG_STATE['poll_errors'] += 1
+            logger.error('DIAG_POLL | instance=%s | transport_error=%s',
+                         DIAG_INSTANCE, type(exc).__name__)
+            raise
+        DIAG_STATE['poll_ok' if status == 200 else 'poll_errors'] += 1
+        count = '-'
+        try:
+            result = json.loads(payload).get('result')
+            if isinstance(result, list):
+                count = len(result)
+        except (ValueError, TypeError, AttributeError):
+            pass
+        logger.info('DIAG_POLL | instance=%s | http=%s | updates=%s | seconds=%.1f',
+                    DIAG_INSTANCE, status, count, time.monotonic() - started)
+        return status, payload
+
+
+async def trace_update(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Runs in group -1 before the existing moderation handlers in group 0."""
+    DIAG_STATE['received'] += 1
+    message, chat, user = update.effective_message, update.effective_chat, update.effective_user
+    kind = next((name for name in (
+        'message', 'edited_message', 'channel_post', 'edited_channel_post',
+        'chat_member', 'my_chat_member', 'callback_query', 'chat_join_request'
+    ) if getattr(update, name, None) is not None), 'other')
+    # Match the moderation handler's routing filter without consuming the update.
+    routed = bool((filters.ChatType.GROUPS & (filters.TEXT | filters.CAPTION)
+                   & ~filters.COMMAND).check_update(update))
+    logger.info('DIAG_RX | instance=%s | update=%s | kind=%s | chat=%s | chat_type=%s | '
+                'user=%s | is_bot=%s | msg=%s | moderation_route=%s',
+                DIAG_INSTANCE, update.update_id, kind, getattr(chat, 'id', None),
+                getattr(chat, 'type', None), getattr(user, 'id', None),
+                getattr(user, 'is_bot', None), getattr(message, 'message_id', None), routed)
+
+
+async def diagnostic_error(update, context):
+    error = context.error
+    if isinstance(error, Conflict):
+        DIAG_STATE['conflicts'] += 1
+        logger.error('DIAG_CONFLICT | instance=%s | count=%s | uptime_s=%s | '
+                     'getUpdates interrupted by another request', DIAG_INSTANCE,
+                     DIAG_STATE['conflicts'], int(time.monotonic() - DIAG_STARTED))
+    else:
+        detail = str(error).replace(BOT_TOKEN, '<redacted>')
+        logger.error('DIAG_ERROR | instance=%s | update=%s | type=%s | detail=%s',
+                     DIAG_INSTANCE, getattr(update, 'update_id', None),
+                     type(error).__name__, detail)
+
+
+async def diagnostic_heartbeat(app):
+    while True:
+        await asyncio.sleep(60)
+        logger.info('DIAG_ALIVE | instance=%s | uptime_s=%s | poll_ok=%s | poll_errors=%s | '
+                    'received=%s | conflicts=%s | queued=%s', DIAG_INSTANCE,
+                    int(time.monotonic() - DIAG_STARTED), DIAG_STATE['poll_ok'],
+                    DIAG_STATE['poll_errors'], DIAG_STATE['received'],
+                    DIAG_STATE['conflicts'], app.update_queue.qsize())
 
 OLD_PATTERNS = [re.compile(p, re.I) for p in [
     r'заработок\s+от\s+[\d\s]+', r'доход\s+от\s+[\d\s]+',
@@ -38,6 +124,7 @@ MENTION_RE = re.compile(r'(?<!\w)@[A-Za-z0-9_]{5,32}\b')
 
 
 async def init_db(app):
+    logger.info('DIAG_STAGE | instance=%s | stage=db_connect', DIAG_INSTANCE)
     pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=3)
     app.bot_data['db'] = pool
     async with pool.acquire() as conn:
@@ -73,9 +160,21 @@ async def init_db(app):
             await conn.execute('DELETE FROM moderation_simulation WHERE chat_id=$1', ALLOWED_CHAT_ID)
             logger.info('DRY_RUN simulation counters reset for test group')
     logger.info('PostgreSQL connected | DRY_RUN=%s | TEST_ADMINS=%s', DRY_RUN, TEST_ADMINS)
+    logger.info('DIAG_READY | instance=%s | bot_id=%s | username=%s | chat=%s | '
+                'DRY_RUN=%s | TEST_ADMINS=%s', DIAG_INSTANCE, app.bot.id,
+                app.bot.username, ALLOWED_CHAT_ID, DRY_RUN, TEST_ADMINS)
+    app.bot_data['diag_heartbeat'] = asyncio.create_task(diagnostic_heartbeat(app))
 
 
 async def close_db(app):
+    task = app.bot_data.pop('diag_heartbeat', None)
+    if task:
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+    logger.info('DIAG_STOP | instance=%s', DIAG_INSTANCE)
     pool = app.bot_data.get('db')
     if pool:
         await pool.close()
@@ -155,6 +254,20 @@ def assess(message, body, record):
     return score, obvious_ad, old, reasons
 
 
+def force_regular_for(chat_id, user_id):
+    return (TEST_FORCE_REGULAR and TEST_FORCE_REGULAR_USER_ID > 0
+            and TEST_FORCE_REGULAR_CHAT_ID < 0
+            and chat_id == TEST_FORCE_REGULAR_CHAT_ID == ALLOWED_CHAT_ID
+            and user_id == TEST_FORCE_REGULAR_USER_ID)
+
+
+def effective_newcomer(record, chat_id, user_id):
+    if force_regular_for(chat_id, user_id):
+        return False
+    return (record['first_violation_newcomer'] if record['first_violation_newcomer'] is not None
+            else newcomer_on_first_violation(record))
+
+
 def newcomer_on_first_violation(record):
     joined_at = record['joined_at']
     if joined_at is None:
@@ -216,16 +329,28 @@ async def send_notice(context, chat_id, user, action):
 async def check_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message, chat, user = update.effective_message, update.effective_chat, update.effective_user
     if not message or not chat or not user or user.is_bot or chat.id != ALLOWED_CHAT_ID:
+        reason = ('missing_message_chat_user' if not message or not chat or not user
+                  else 'bot_sender' if user.is_bot else 'wrong_chat')
+        logger.info('DIAG_SKIP | instance=%s | update=%s | reason=%s',
+                    DIAG_INSTANCE, update.update_id, reason)
         return
     try:
+        logger.info('DIAG_STAGE | instance=%s | update=%s | stage=get_chat_member',
+                    DIAG_INSTANCE, update.update_id)
         member = await context.bot.get_chat_member(chat.id, user.id)
         is_admin = member.status in (ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.OWNER)
         if is_admin and not TEST_ADMINS:
+            logger.info('DIAG_SKIP | instance=%s | update=%s | reason=admin_exempt',
+                        DIAG_INSTANCE, update.update_id)
             return
         body = message.text or message.caption or ''
         if not body:
+            logger.info('DIAG_SKIP | instance=%s | update=%s | reason=no_text_or_caption',
+                        DIAG_INSTANCE, update.update_id)
             return
         pool = context.application.bot_data['db']
+        logger.info('DIAG_STAGE | instance=%s | update=%s | stage=db_record',
+                    DIAG_INSTANCE, update.update_id)
         async with pool.acquire() as conn:
             record = await conn.fetchrow('''
                 INSERT INTO group_members (chat_id, user_id, last_message_at, message_count)
@@ -236,10 +361,13 @@ async def check_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             ''', chat.id, user.id)
         score, obvious_ad, old, reasons = assess(message, body, record)
         suspicious = old or score >= 5 or obvious_ad
+        logger.info('DIAG_DECISION | instance=%s | update=%s | score=%s | suspicious=%s | %s',
+                    DIAG_INSTANCE, update.update_id, score, suspicious, reasons)
         if not suspicious:
+            logger.info('DIAG_SKIP | instance=%s | update=%s | reason=not_spam',
+                        DIAG_INSTANCE, update.update_id)
             return
-        newcomer = (record['first_violation_newcomer'] if record['first_violation_newcomer'] is not None
-                    else newcomer_on_first_violation(record))
+        newcomer = effective_newcomer(record, chat.id, user.id)
         next_violations = record['violations'] + 1
         proposed_action = action_for(next_violations, newcomer)
         logger.warning('Spam candidate | user=%s | msg=%s | score=%s | obvious_ad=%s | %s | '
@@ -280,8 +408,7 @@ async def check_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     SELECT violations, joined_at, first_violation_newcomer
                     FROM group_members WHERE chat_id=$1 AND user_id=$2 FOR UPDATE
                 ''', chat.id, user.id)
-                locked_newcomer = (row['first_violation_newcomer'] if row['first_violation_newcomer'] is not None
-                                   else newcomer_on_first_violation(row))
+                locked_newcomer = effective_newcomer(row, chat.id, user.id)
                 violations = row['violations'] + 1
                 await conn.execute('''
                     UPDATE group_members SET violations=$3, last_violation_at=NOW(),
@@ -313,14 +440,23 @@ async def check_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 def main():
+    logger.info('DIAG_BOOT | build=%s | instance=%s | file=%s | sha256=%s | pid=%s | '
+                'ptb=%s | deployment=%s | commit=%s', DIAG_BUILD, DIAG_INSTANCE,
+                Path(__file__).name, hashlib.sha256(Path(__file__).read_bytes()).hexdigest()[:12],
+                os.getpid(), PTB_VERSION, os.getenv('RAILWAY_DEPLOYMENT_ID', 'local'),
+                os.getenv('RAILWAY_GIT_COMMIT_SHA', 'unknown')[:12])
     app = (ApplicationBuilder().token(BOT_TOKEN)
+           .get_updates_request(DiagnosticRequest(connection_pool_size=1))
            .post_init(init_db).post_shutdown(close_db).build())
+    app.add_handler(TypeHandler(Update, trace_update), group=-1)
+    app.add_error_handler(diagnostic_error)
     app.add_handler(ChatMemberHandler(joined, ChatMemberHandler.CHAT_MEMBER))
     app.add_handler(MessageHandler(filters.ChatType.GROUPS & filters.StatusUpdate.NEW_CHAT_MEMBERS, service_join))
     app.add_handler(MessageHandler(filters.ChatType.GROUPS & (filters.TEXT | filters.CAPTION) & ~filters.COMMAND,
                                    check_message))
-    logger.info('Starting | chat=%s | DRY_RUN=%s | newcomer=%sh | mute=%sh',
-                ALLOWED_CHAT_ID, DRY_RUN, NEWCOMER_HOURS, MUTE_HOURS)
+    logger.info('Starting | chat=%s | DRY_RUN=%s | newcomer=%sh | mute=%sh | force_regular=%s | test_user=%s | test_chat=%s',
+                ALLOWED_CHAT_ID, DRY_RUN, NEWCOMER_HOURS, MUTE_HOURS,
+                TEST_FORCE_REGULAR, TEST_FORCE_REGULAR_USER_ID, TEST_FORCE_REGULAR_CHAT_ID)
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
