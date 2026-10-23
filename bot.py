@@ -20,10 +20,6 @@ DATABASE_URL = os.environ['DATABASE_URL']
 ALLOWED_CHAT_ID = int(os.environ['ALLOWED_CHAT_ID'])
 DRY_RUN = os.getenv('DRY_RUN', 'true').strip().lower() != 'false'
 TEST_ADMINS = os.getenv('TEST_ADMINS', 'false').strip().lower() == 'true'
-# Test-only override, scoped to one user AND the dedicated test chat.
-TEST_FORCE_REGULAR = os.getenv('TEST_FORCE_REGULAR', 'false').strip().lower() == 'true'
-TEST_FORCE_REGULAR_USER_ID = int(os.getenv('TEST_FORCE_REGULAR_USER_ID', '0'))
-TEST_FORCE_REGULAR_CHAT_ID = int(os.getenv('TEST_FORCE_REGULAR_CHAT_ID', '0'))
 NOTICE_TTL_SECONDS = 60
 NEWCOMER_HOURS = 24
 MUTE_HOURS = 48
@@ -63,19 +59,6 @@ async def init_db(app):
             ALTER TABLE group_members
             ADD COLUMN IF NOT EXISTS first_violation_newcomer BOOLEAN
         ''')
-        await conn.execute('''
-            CREATE TABLE IF NOT EXISTS moderation_simulation (
-                chat_id BIGINT NOT NULL,
-                user_id BIGINT NOT NULL,
-                violations INTEGER NOT NULL DEFAULT 0,
-                first_violation_newcomer BOOLEAN,
-                PRIMARY KEY (chat_id, user_id)
-            )
-        ''')
-        if DRY_RUN:
-            # Simulation starts fresh after every deployment; production counts are untouched.
-            await conn.execute('DELETE FROM moderation_simulation WHERE chat_id=$1', ALLOWED_CHAT_ID)
-            logger.info('DRY_RUN simulation counters reset for test group')
     logger.info('PostgreSQL connected | DRY_RUN=%s | TEST_ADMINS=%s', DRY_RUN, TEST_ADMINS)
 
 
@@ -157,20 +140,6 @@ def assess(message, body, record):
     obvious_ad = (cta and (has_link or mentions) and (sales or tg_link or has_link)) or (dm and sales and has_link)
     reasons = f'old={old}, link={has_link}, telegram={tg_link}, cta={cta}, sales={sales}, dm={dm}, mention={mentions}'
     return score, obvious_ad, old, reasons
-
-
-def force_regular_for(chat_id, user_id):
-    return (TEST_FORCE_REGULAR and TEST_FORCE_REGULAR_USER_ID > 0
-            and TEST_FORCE_REGULAR_CHAT_ID < 0
-            and chat_id == TEST_FORCE_REGULAR_CHAT_ID == ALLOWED_CHAT_ID
-            and user_id == TEST_FORCE_REGULAR_USER_ID)
-
-
-def effective_newcomer(record, chat_id, user_id):
-    if force_regular_for(chat_id, user_id):
-        return False
-    return (record['first_violation_newcomer'] if record['first_violation_newcomer'] is not None
-            else newcomer_on_first_violation(record))
 
 
 def newcomer_on_first_violation(record):
@@ -256,7 +225,8 @@ async def check_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         suspicious = old or score >= 5 or obvious_ad
         if not suspicious:
             return
-        newcomer = effective_newcomer(record, chat.id, user.id)
+        newcomer = (record['first_violation_newcomer'] if record['first_violation_newcomer'] is not None
+                    else newcomer_on_first_violation(record))
         next_violations = record['violations'] + 1
         proposed_action = action_for(next_violations, newcomer)
         logger.warning('Spam candidate | user=%s | msg=%s | score=%s | obvious_ad=%s | %s | '
@@ -264,26 +234,6 @@ async def check_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                        user.id, message.message_id, score, obvious_ad, reasons,
                        next_violations, newcomer, proposed_action, DRY_RUN)
         if DRY_RUN:
-            # Count hypothetical violations separately, without changing real violation history.
-            async with pool.acquire() as conn:
-                async with conn.transaction():
-                    sim = await conn.fetchrow('''
-                        INSERT INTO moderation_simulation (chat_id, user_id, violations, first_violation_newcomer)
-                        VALUES ($1, $2, 0, $3)
-                        ON CONFLICT (chat_id, user_id) DO UPDATE SET
-                            user_id=EXCLUDED.user_id
-                        RETURNING violations, first_violation_newcomer
-                    ''', chat.id, user.id, newcomer)
-                    simulated_count = sim['violations'] + 1
-                    simulated_newcomer = sim['first_violation_newcomer']
-                    await conn.execute('''
-                        UPDATE moderation_simulation SET violations=$3
-                        WHERE chat_id=$1 AND user_id=$2
-                    ''', chat.id, user.id, simulated_count)
-            logger.warning('SIMULATION | user=%s | simulated_violation=%s | newcomer=%s | '
-                           'proposed_action=%s | NO deletion, mute, ban or notice',
-                           user.id, simulated_count, simulated_newcomer,
-                           action_for(simulated_count, simulated_newcomer))
             return
         try:
             await message.delete()
@@ -297,7 +247,8 @@ async def check_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     SELECT violations, joined_at, first_violation_newcomer
                     FROM group_members WHERE chat_id=$1 AND user_id=$2 FOR UPDATE
                 ''', chat.id, user.id)
-                locked_newcomer = effective_newcomer(row, chat.id, user.id)
+                locked_newcomer = (row['first_violation_newcomer'] if row['first_violation_newcomer'] is not None
+                                   else newcomer_on_first_violation(row))
                 violations = row['violations'] + 1
                 await conn.execute('''
                     UPDATE group_members SET violations=$3, last_violation_at=NOW(),
@@ -335,9 +286,8 @@ def main():
     app.add_handler(MessageHandler(filters.ChatType.GROUPS & filters.StatusUpdate.NEW_CHAT_MEMBERS, service_join))
     app.add_handler(MessageHandler(filters.ChatType.GROUPS & (filters.TEXT | filters.CAPTION) & ~filters.COMMAND,
                                    check_message))
-    logger.info('Starting | chat=%s | DRY_RUN=%s | newcomer=%sh | mute=%sh | force_regular=%s | test_user=%s | test_chat=%s',
-                ALLOWED_CHAT_ID, DRY_RUN, NEWCOMER_HOURS, MUTE_HOURS,
-                TEST_FORCE_REGULAR, TEST_FORCE_REGULAR_USER_ID, TEST_FORCE_REGULAR_CHAT_ID)
+    logger.info('Starting | chat=%s | DRY_RUN=%s | newcomer=%sh | mute=%sh',
+                ALLOWED_CHAT_ID, DRY_RUN, NEWCOMER_HOURS, MUTE_HOURS)
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
