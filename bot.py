@@ -59,6 +59,19 @@ async def init_db(app):
             ALTER TABLE group_members
             ADD COLUMN IF NOT EXISTS first_violation_newcomer BOOLEAN
         ''')
+        await conn.execute('''
+            CREATE TABLE IF NOT EXISTS moderation_simulation (
+                chat_id BIGINT NOT NULL,
+                user_id BIGINT NOT NULL,
+                violations INTEGER NOT NULL DEFAULT 0,
+                first_violation_newcomer BOOLEAN,
+                PRIMARY KEY (chat_id, user_id)
+            )
+        ''')
+        if DRY_RUN:
+            # Simulation starts fresh after every deployment; production counts are untouched.
+            await conn.execute('DELETE FROM moderation_simulation WHERE chat_id=$1', ALLOWED_CHAT_ID)
+            logger.info('DRY_RUN simulation counters reset for test group')
     logger.info('PostgreSQL connected | DRY_RUN=%s | TEST_ADMINS=%s', DRY_RUN, TEST_ADMINS)
 
 
@@ -234,6 +247,26 @@ async def check_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                        user.id, message.message_id, score, obvious_ad, reasons,
                        next_violations, newcomer, proposed_action, DRY_RUN)
         if DRY_RUN:
+            # Count hypothetical violations separately, without changing real violation history.
+            async with pool.acquire() as conn:
+                async with conn.transaction():
+                    sim = await conn.fetchrow('''
+                        INSERT INTO moderation_simulation (chat_id, user_id, violations, first_violation_newcomer)
+                        VALUES ($1, $2, 0, $3)
+                        ON CONFLICT (chat_id, user_id) DO UPDATE SET
+                            user_id=EXCLUDED.user_id
+                        RETURNING violations, first_violation_newcomer
+                    ''', chat.id, user.id, newcomer)
+                    simulated_count = sim['violations'] + 1
+                    simulated_newcomer = sim['first_violation_newcomer']
+                    await conn.execute('''
+                        UPDATE moderation_simulation SET violations=$3
+                        WHERE chat_id=$1 AND user_id=$2
+                    ''', chat.id, user.id, simulated_count)
+            logger.warning('SIMULATION | user=%s | simulated_violation=%s | newcomer=%s | '
+                           'proposed_action=%s | NO deletion, mute, ban or notice',
+                           user.id, simulated_count, simulated_newcomer,
+                           action_for(simulated_count, simulated_newcomer))
             return
         try:
             await message.delete()
