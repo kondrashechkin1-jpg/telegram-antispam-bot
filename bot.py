@@ -20,6 +20,10 @@ DATABASE_URL = os.environ['DATABASE_URL']
 ALLOWED_CHAT_ID = int(os.environ['ALLOWED_CHAT_ID'])
 DRY_RUN = os.getenv('DRY_RUN', 'true').strip().lower() != 'false'
 TEST_ADMINS = os.getenv('TEST_ADMINS', 'false').strip().lower() == 'true'
+# Test-only override, scoped to one user AND the dedicated test chat.
+TEST_FORCE_REGULAR = os.getenv('TEST_FORCE_REGULAR', 'false').strip().lower() == 'true'
+TEST_FORCE_REGULAR_USER_ID = int(os.getenv('TEST_FORCE_REGULAR_USER_ID', '0'))
+TEST_FORCE_REGULAR_CHAT_ID = int(os.getenv('TEST_FORCE_REGULAR_CHAT_ID', '0'))
 NOTICE_TTL_SECONDS = 60
 NEWCOMER_HOURS = 24
 MUTE_HOURS = 48
@@ -155,6 +159,20 @@ def assess(message, body, record):
     return score, obvious_ad, old, reasons
 
 
+def force_regular_for(chat_id, user_id):
+    return (TEST_FORCE_REGULAR and TEST_FORCE_REGULAR_USER_ID > 0
+            and TEST_FORCE_REGULAR_CHAT_ID < 0
+            and chat_id == TEST_FORCE_REGULAR_CHAT_ID == ALLOWED_CHAT_ID
+            and user_id == TEST_FORCE_REGULAR_USER_ID)
+
+
+def effective_newcomer(record, chat_id, user_id):
+    if force_regular_for(chat_id, user_id):
+        return False
+    return (record['first_violation_newcomer'] if record['first_violation_newcomer'] is not None
+            else newcomer_on_first_violation(record))
+
+
 def newcomer_on_first_violation(record):
     joined_at = record['joined_at']
     if joined_at is None:
@@ -238,8 +256,7 @@ async def check_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         suspicious = old or score >= 5 or obvious_ad
         if not suspicious:
             return
-        newcomer = (record['first_violation_newcomer'] if record['first_violation_newcomer'] is not None
-                    else newcomer_on_first_violation(record))
+        newcomer = effective_newcomer(record, chat.id, user.id)
         next_violations = record['violations'] + 1
         proposed_action = action_for(next_violations, newcomer)
         logger.warning('Spam candidate | user=%s | msg=%s | score=%s | obvious_ad=%s | %s | '
@@ -280,8 +297,7 @@ async def check_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     SELECT violations, joined_at, first_violation_newcomer
                     FROM group_members WHERE chat_id=$1 AND user_id=$2 FOR UPDATE
                 ''', chat.id, user.id)
-                locked_newcomer = (row['first_violation_newcomer'] if row['first_violation_newcomer'] is not None
-                                   else newcomer_on_first_violation(row))
+                locked_newcomer = effective_newcomer(row, chat.id, user.id)
                 violations = row['violations'] + 1
                 await conn.execute('''
                     UPDATE group_members SET violations=$3, last_violation_at=NOW(),
@@ -319,8 +335,9 @@ def main():
     app.add_handler(MessageHandler(filters.ChatType.GROUPS & filters.StatusUpdate.NEW_CHAT_MEMBERS, service_join))
     app.add_handler(MessageHandler(filters.ChatType.GROUPS & (filters.TEXT | filters.CAPTION) & ~filters.COMMAND,
                                    check_message))
-    logger.info('Starting | chat=%s | DRY_RUN=%s | newcomer=%sh | mute=%sh',
-                ALLOWED_CHAT_ID, DRY_RUN, NEWCOMER_HOURS, MUTE_HOURS)
+    logger.info('Starting | chat=%s | DRY_RUN=%s | newcomer=%sh | mute=%sh | force_regular=%s | test_user=%s | test_chat=%s',
+                ALLOWED_CHAT_ID, DRY_RUN, NEWCOMER_HOURS, MUTE_HOURS,
+                TEST_FORCE_REGULAR, TEST_FORCE_REGULAR_USER_ID, TEST_FORCE_REGULAR_CHAT_ID)
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
