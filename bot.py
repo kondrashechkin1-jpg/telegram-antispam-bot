@@ -10,6 +10,7 @@ logger = logging.getLogger(__name__)
 BOT_TOKEN = os.environ['BOT_TOKEN']
 DRY_RUN = os.getenv('DRY_RUN', 'true').strip().lower() != 'false'
 ALLOWED_CHAT_ID = int(os.getenv('ALLOWED_CHAT_ID', '0'))
+TEST_ADMINS = os.getenv('TEST_ADMINS', 'false').strip().lower() == 'true'
 
 PATTERNS = [
     re.compile(p, re.IGNORECASE) for p in [
@@ -31,7 +32,7 @@ async def check_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     if ALLOWED_CHAT_ID == 0 or chat.id != ALLOWED_CHAT_ID:
         return
     member = await context.bot.get_chat_member(chat.id, user.id)
-    if member.status in ('administrator', 'creator'):
+    if member.status in ('administrator', 'creator') and not TEST_ADMINS:
         return
     body = message.text or message.caption or ''
     if not body:
@@ -51,7 +52,7 @@ async def check_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 def main() -> None:
     app = ApplicationBuilder().token(BOT_TOKEN).build()
     app.add_handler(MessageHandler(filters.ChatType.GROUPS & (filters.TEXT | filters.CAPTION) & ~filters.COMMAND, check_message))
-    logger.info('Bot started | DRY_RUN=%s | ALLOWED_CHAT_ID=%s', DRY_RUN, ALLOWED_CHAT_ID)
+    logger.info('Bot started | DRY_RUN=%s | ALLOWED_CHAT_ID=%s | TEST_ADMINS=%s', DRY_RUN, ALLOWED_CHAT_ID, TEST_ADMINS)
     app.run_polling()
 
 if __name__ == '__main__':
