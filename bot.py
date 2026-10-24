@@ -189,11 +189,28 @@ async def ai_shadow_check(message, body, update_id, app):
         logger.info('AI_SHADOW | update=%s | spam=%s | confidence=%s | reason=%s | input_tokens=%s | output_tokens=%s | NO_ACTION',
                     update_id, result.get('spam'), result.get('confidence'),
                     str(result.get('reason', ''))[:140], usage.get('input_tokens'), usage.get('output_tokens'))
+    except httpx.HTTPStatusError as exc:
+        # Log only safe structured fields, never response text, headers, or secrets.
+        status = exc.response.status_code
+        error_type = 'unknown'
+        error_code = 'unknown'
+        try:
+            api_error = exc.response.json().get('error', {})
+            if isinstance(api_error, dict):
+                for field, value in [('type', api_error.get('type')), ('code', api_error.get('code'))]:
+                    if isinstance(value, str) and re.fullmatch(r'[a-zA-Z0-9_\-]{1,64}', value):
+                        if field == 'type':
+                            error_type = value
+                        else:
+                            error_code = value
+        except (ValueError, AttributeError, TypeError):
+            pass
+        logger.warning('AI_SHADOW_HTTP_ERROR | update=%s | status=%s | api_type=%s | api_code=%s | NO_ACTION',
+                       update_id, status, error_type, error_code)
     except Exception as exc:
         # Never log headers, tokens, request body, or response body.
-        logger.warning('AI_SHADOW_ERROR | update=%s | type=%s | key_has_newline=%s | key_prefix_ok=%s | NO_ACTION',
-                       update_id, type(exc).__name__, '\n' in OPENAI_API_KEY or '\r' in OPENAI_API_KEY,
-                       OPENAI_API_KEY.startswith('sk-'))
+        logger.warning('AI_SHADOW_ERROR | update=%s | type=%s | NO_ACTION',
+                       update_id, type(exc).__name__)
 
 
 async def init_db(app):
