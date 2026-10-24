@@ -39,7 +39,7 @@ MUTE_HOURS = 48
 
 # AI shadow mode: observes decisions but NEVER moderates or posts messages.
 AI_SHADOW_ENABLED = os.getenv('AI_SHADOW_ENABLED', 'false').lower() == 'true'
-OPENAI_API_KEY = os.getenv('OPENAI_API_KEY', '')
+OPENAI_API_KEY = os.getenv('OPENAI_API_KEY', '').strip().strip('\"').strip("'")
 AI_MODEL = 'gpt-5-nano'
 # Strict request-count safeguard plus conservative per-request cost reservation.
 # Not a provider-side financial guarantee; also keep auto-recharge disabled.
@@ -191,8 +191,9 @@ async def ai_shadow_check(message, body, update_id, app):
                     str(result.get('reason', ''))[:140], usage.get('input_tokens'), usage.get('output_tokens'))
     except Exception as exc:
         # Never log headers, tokens, request body, or response body.
-        logger.warning('AI_SHADOW_ERROR | update=%s | type=%s | NO_ACTION',
-                       update_id, type(exc).__name__)
+        logger.warning('AI_SHADOW_ERROR | update=%s | type=%s | key_has_newline=%s | key_prefix_ok=%s | NO_ACTION',
+                       update_id, type(exc).__name__, '\n' in OPENAI_API_KEY or '\r' in OPENAI_API_KEY,
+                       OPENAI_API_KEY.startswith('sk-'))
 
 
 async def init_db(app):
