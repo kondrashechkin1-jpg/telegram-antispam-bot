@@ -35,7 +35,9 @@ TEST_FORCE_REGULAR_USER_ID = int(os.getenv('TEST_FORCE_REGULAR_USER_ID', '0'))
 TEST_FORCE_REGULAR_CHAT_ID = int(os.getenv('TEST_FORCE_REGULAR_CHAT_ID', '0'))
 NOTICE_TTL_SECONDS = 60
 NEWCOMER_HOURS = 24
-MUTE_HOURS = 48
+MUTE_HOURS = 24
+VIOLATION_RESET_DAYS = 14
+HISTORY_RETENTION_DAYS = 30
 
 # AI shadow mode: observes decisions but NEVER moderates or posts messages.
 AI_SHADOW_ENABLED = os.getenv('AI_SHADOW_ENABLED', 'false').lower() == 'true'
@@ -262,6 +264,22 @@ async def ai_shadow_check(message, body, update_id, app):
                        update_id, type(exc).__name__)
 
 
+async def cleanup_history_loop(app):
+    # Delete detailed evidence after 30 days; never touch member counters.
+    while True:
+        try:
+            async with app.bot_data['db'].acquire() as conn:
+                result = await conn.execute('''DELETE FROM moderation_history
+                    WHERE occurred_at < NOW() - ($1 * INTERVAL '1 day')''',
+                    HISTORY_RETENTION_DAYS)
+            logger.info('HISTORY_CLEANUP | %s', result)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception('History cleanup failed')
+        await asyncio.sleep(24 * 60 * 60)
+
+
 async def init_db(app):
     logger.info('DIAG_STAGE | instance=%s | stage=db_connect', DIAG_INSTANCE)
     pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=3)
@@ -275,6 +293,8 @@ async def init_db(app):
                 last_message_at TIMESTAMPTZ,
                 message_count BIGINT NOT NULL DEFAULT 0,
                 violations INTEGER NOT NULL DEFAULT 0,
+                newcomer_violations INTEGER NOT NULL DEFAULT 0,
+                total_violations BIGINT NOT NULL DEFAULT 0,
                 last_violation_at TIMESTAMPTZ,
                 PRIMARY KEY (chat_id, user_id)
             )
@@ -285,11 +305,42 @@ async def init_db(app):
             ALTER TABLE group_members
             ADD COLUMN IF NOT EXISTS first_violation_newcomer BOOLEAN
         ''')
+        # Additive migration: preserve the existing lifetime violation count.
+        await conn.execute('''ALTER TABLE group_members
+            ADD COLUMN IF NOT EXISTS newcomer_violations INTEGER NOT NULL DEFAULT 0''')
+        await conn.execute('''ALTER TABLE group_members
+            ADD COLUMN IF NOT EXISTS total_violations BIGINT''')
+        await conn.execute('''UPDATE group_members SET total_violations=violations
+            WHERE total_violations IS NULL''')
+        await conn.execute('''ALTER TABLE group_members
+            ALTER COLUMN total_violations SET DEFAULT 0''')
+        await conn.execute('''ALTER TABLE group_members
+            ALTER COLUMN total_violations SET NOT NULL''')
+        await conn.execute('''CREATE TABLE IF NOT EXISTS moderation_history (
+            id BIGSERIAL PRIMARY KEY,
+            chat_id BIGINT NOT NULL,
+            user_id BIGINT NOT NULL,
+            message_id BIGINT,
+            message_text TEXT,
+            reason TEXT NOT NULL,
+            violation_type TEXT NOT NULL,
+            decision_source TEXT NOT NULL,
+            action TEXT NOT NULL,
+            occurred_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            expires_at TIMESTAMPTZ,
+            ai_confidence DOUBLE PRECISION
+        )''')
+        await conn.execute('''CREATE INDEX IF NOT EXISTS moderation_history_occurred_idx
+            ON moderation_history (occurred_at)''')
+        await conn.execute('''CREATE INDEX IF NOT EXISTS moderation_history_user_idx
+            ON moderation_history (chat_id, user_id, occurred_at DESC)''')
         await conn.execute('''
             CREATE TABLE IF NOT EXISTS moderation_simulation (
                 chat_id BIGINT NOT NULL,
                 user_id BIGINT NOT NULL,
                 violations INTEGER NOT NULL DEFAULT 0,
+                newcomer_violations INTEGER NOT NULL DEFAULT 0,
+                last_violation_at TIMESTAMPTZ,
                 first_violation_newcomer BOOLEAN,
                 PRIMARY KEY (chat_id, user_id)
             )
@@ -302,6 +353,10 @@ async def init_db(app):
                 created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
             )
         ''')
+        await conn.execute('''ALTER TABLE moderation_simulation
+            ADD COLUMN IF NOT EXISTS newcomer_violations INTEGER NOT NULL DEFAULT 0''')
+        await conn.execute('''ALTER TABLE moderation_simulation
+            ADD COLUMN IF NOT EXISTS last_violation_at TIMESTAMPTZ''')
         if DRY_RUN:
             # Simulation starts fresh after every deployment; production counts are untouched.
             await conn.execute('DELETE FROM moderation_simulation WHERE chat_id=$1', ALLOWED_CHAT_ID)
@@ -311,16 +366,18 @@ async def init_db(app):
                 'DRY_RUN=%s | TEST_ADMINS=%s', DIAG_INSTANCE, app.bot.id,
                 app.bot.username, ALLOWED_CHAT_ID, DRY_RUN, TEST_ADMINS)
     app.bot_data['diag_heartbeat'] = asyncio.create_task(diagnostic_heartbeat(app))
+    app.bot_data['history_cleanup'] = asyncio.create_task(cleanup_history_loop(app))
 
 
 async def close_db(app):
-    task = app.bot_data.pop('diag_heartbeat', None)
-    if task:
-        task.cancel()
-        try:
-            await task
-        except asyncio.CancelledError:
-            pass
+    for task_name in ('diag_heartbeat', 'history_cleanup'):
+        task = app.bot_data.pop(task_name, None)
+        if task:
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
     logger.info('DIAG_STOP | instance=%s', DIAG_INSTANCE)
     pool = app.bot_data.get('db')
     if pool:
@@ -335,6 +392,7 @@ async def save_join(chat_id, user_id, joined_at, pool):
             ON CONFLICT (chat_id, user_id) DO UPDATE SET
                 joined_at=EXCLUDED.joined_at,
                 violations=0,
+                newcomer_violations=0,
                 first_violation_newcomer=NULL,
                 last_violation_at=NULL
         ''', chat_id, user_id, joined_at)
@@ -409,10 +467,8 @@ def force_regular_for(chat_id, user_id):
 
 
 def effective_newcomer(record, chat_id, user_id):
-    if force_regular_for(chat_id, user_id):
-        return False
-    return (record['first_violation_newcomer'] if record['first_violation_newcomer'] is not None
-            else newcomer_on_first_violation(record))
+    # Status depends ONLY on current membership age, never on first violation.
+    return not force_regular_for(chat_id, user_id) and newcomer_on_first_violation(record)
 
 
 def newcomer_on_first_violation(record):
@@ -423,11 +479,18 @@ def newcomer_on_first_violation(record):
     return timedelta(0) <= age < timedelta(hours=NEWCOMER_HOURS)
 
 
+def active_regular_violations(record, now):
+    last = record['last_violation_at']
+    if last is None or now - last >= timedelta(days=VIOLATION_RESET_DAYS):
+        return 0
+    return record['violations']
+
+
 def action_for(violations, newcomer):
     if newcomer:
         return 'delete_and_ban' if violations >= 2 else 'delete_and_warn_new'
     if violations == 1:
-        return 'delete_only'
+        return 'delete_and_warn_regular_first'
     if violations == 2:
         return 'delete_and_warn_regular'
     return 'delete_and_mute'
@@ -443,11 +506,13 @@ def notice_for(action, mention):
         return f'Поймал за рекламой {mention}. Пока почистил за ним следы, но в следующий раз накажу 😎'
     if action == 'delete_and_ban':
         return f'Доигрался, дружок. {mention} наказан удалением за рекламу. Так обидно, я думал, он норм 🥹'
+    if action == 'delete_and_warn_regular_first':
+        return f'Поймал за рекламой {mention}. Сообщение удалено, это первое предупреждение.'
     if action == 'delete_and_warn_regular':
         return (f'Поймал за рекламой {mention}. Пока почистил за ним следы, '
-                'но в следующий раз засуну кляп в рот на 48 часов. Тебе такое нравится? 🥰')
+                'но в следующий раз засуну кляп в рот на 24 часа. Тебе такое нравится? 🥰')
     if action == 'delete_and_mute':
-        return (f'Я медленно вставляю кляп в твой рот на 48 часов, {mention}. '
+        return (f'Я медленно вставляю кляп в твой рот на 24 часа, {mention}. '
                 'Не рекламируй тут, пожалуйста :(')
     return None
 
@@ -504,7 +569,7 @@ async def check_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 VALUES ($1, $2, NOW(), 1)
                 ON CONFLICT (chat_id, user_id) DO UPDATE SET
                     last_message_at=NOW(), message_count=group_members.message_count+1
-                RETURNING joined_at, message_count, violations, first_violation_newcomer
+                RETURNING joined_at, message_count, violations, newcomer_violations, last_violation_at, first_violation_newcomer
             ''', chat.id, user.id)
         score, obvious_ad, old, reasons = assess(message, body, record)
         suspicious = old or score >= 5 or obvious_ad
@@ -521,54 +586,80 @@ async def check_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         DIAG_INSTANCE, update.update_id)
             return
         newcomer = effective_newcomer(record, chat.id, user.id)
-        next_violations = record['violations'] + 1
+        next_violations = ((record['newcomer_violations'] if newcomer else
+                            active_regular_violations(record, datetime.now(timezone.utc))) + 1)
         proposed_action = action_for(next_violations, newcomer)
         logger.warning('Spam candidate | user=%s | msg=%s | score=%s | obvious_ad=%s | %s | '
                        'next_violation=%s | newcomer=%s | proposed_action=%s | DRY_RUN=%s',
                        user.id, message.message_id, score, obvious_ad, reasons,
                        next_violations, newcomer, proposed_action, DRY_RUN)
         if DRY_RUN:
-            # Count hypothetical violations separately, without changing real violation history.
+            # Simulated counters never modify production counters or history.
             async with pool.acquire() as conn:
                 async with conn.transaction():
                     sim = await conn.fetchrow('''
-                        INSERT INTO moderation_simulation (chat_id, user_id, violations, first_violation_newcomer)
-                        VALUES ($1, $2, 0, $3)
-                        ON CONFLICT (chat_id, user_id) DO UPDATE SET
-                            user_id=EXCLUDED.user_id
-                        RETURNING violations, first_violation_newcomer
-                    ''', chat.id, user.id, newcomer)
-                    simulated_count = sim['violations'] + 1
-                    simulated_newcomer = sim['first_violation_newcomer']
-                    await conn.execute('''
-                        UPDATE moderation_simulation SET violations=$3
-                        WHERE chat_id=$1 AND user_id=$2
-                    ''', chat.id, user.id, simulated_count)
+                        INSERT INTO moderation_simulation (chat_id, user_id)
+                        VALUES ($1, $2)
+                        ON CONFLICT (chat_id, user_id) DO NOTHING
+                        RETURNING violations, newcomer_violations, last_violation_at
+                    ''', chat.id, user.id)
+                    if sim is None:
+                        sim = await conn.fetchrow('''SELECT violations, newcomer_violations,
+                            last_violation_at FROM moderation_simulation
+                            WHERE chat_id=$1 AND user_id=$2 FOR UPDATE''', chat.id, user.id)
+                    now = datetime.now(timezone.utc)
+                    simulated_count = ((sim['newcomer_violations'] if newcomer else
+                                        active_regular_violations(sim, now)) + 1)
+                    if newcomer:
+                        await conn.execute('''UPDATE moderation_simulation
+                            SET newcomer_violations=$3, last_violation_at=$4
+                            WHERE chat_id=$1 AND user_id=$2''', chat.id, user.id,
+                            simulated_count, now)
+                    else:
+                        await conn.execute('''UPDATE moderation_simulation
+                            SET violations=$3, last_violation_at=$4
+                            WHERE chat_id=$1 AND user_id=$2''', chat.id, user.id,
+                            simulated_count, now)
             logger.warning('SIMULATION | user=%s | simulated_violation=%s | newcomer=%s | '
                            'proposed_action=%s | NO deletion, mute, ban or notice',
-                           user.id, simulated_count, simulated_newcomer,
-                           action_for(simulated_count, simulated_newcomer))
+                           user.id, simulated_count, newcomer,
+                           action_for(simulated_count, newcomer))
             return
         try:
             await message.delete()
         except Exception:
             logger.exception('Could not delete message %s; no penalty recorded', message.message_id)
             return
-        # Keep a single member's counters consistent when messages arrive quickly.
+        # Atomic counters and audit record. Only record confirmed deletions.
         async with pool.acquire() as conn:
             async with conn.transaction():
                 row = await conn.fetchrow('''
-                    SELECT violations, joined_at, first_violation_newcomer
+                    SELECT violations, newcomer_violations, joined_at, last_violation_at
                     FROM group_members WHERE chat_id=$1 AND user_id=$2 FOR UPDATE
                 ''', chat.id, user.id)
                 locked_newcomer = effective_newcomer(row, chat.id, user.id)
-                violations = row['violations'] + 1
-                await conn.execute('''
-                    UPDATE group_members SET violations=$3, last_violation_at=NOW(),
-                        first_violation_newcomer=COALESCE(first_violation_newcomer, $4)
-                    WHERE chat_id=$1 AND user_id=$2
-                ''', chat.id, user.id, violations, locked_newcomer)
-        action = action_for(violations, locked_newcomer)
+                now = datetime.now(timezone.utc)
+                violations = ((row['newcomer_violations'] if locked_newcomer else
+                               active_regular_violations(row, now)) + 1)
+                if locked_newcomer:
+                    await conn.execute('''UPDATE group_members SET
+                        newcomer_violations=$3, total_violations=total_violations+1,
+                        last_violation_at=$4 WHERE chat_id=$1 AND user_id=$2''',
+                        chat.id, user.id, violations, now)
+                else:
+                    await conn.execute('''UPDATE group_members SET
+                        violations=$3, total_violations=total_violations+1,
+                        last_violation_at=$4 WHERE chat_id=$1 AND user_id=$2''',
+                        chat.id, user.id, violations, now)
+                action = action_for(violations, locked_newcomer)
+                expires_at = (now + timedelta(hours=MUTE_HOURS)
+                              if action == 'delete_and_mute' else None)
+                await conn.execute('''INSERT INTO moderation_history
+                    (chat_id, user_id, message_id, message_text, reason,
+                     violation_type, decision_source, action, occurred_at, expires_at)
+                    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)''',
+                    chat.id, user.id, message.message_id, body[:1600], reasons,
+                    'advertising_suspected', 'heuristic', action, now, expires_at)
         logger.info('Deleted | user=%s | violations=%s | newcomer=%s | action=%s',
                     user.id, violations, locked_newcomer, action)
         if is_admin:
