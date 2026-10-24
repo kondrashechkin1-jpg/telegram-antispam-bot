@@ -178,13 +178,33 @@ async def ai_shadow_check(message, body, update_id, app):
             response = await client.post('https://api.openai.com/v1/responses',
                 headers={'Authorization': 'Bearer ' + OPENAI_API_KEY},
                 json={'model': AI_MODEL, 'instructions': instructions,
-                      'input': payload, 'max_output_tokens': 400})
+                      'input': payload, 'max_output_tokens': 1200,
+                      'reasoning': {'effort': 'minimal'}})
             response.raise_for_status()
             data = response.json()
         output = ''.join(part.get('text', '') for item in data.get('output', [])
                          for part in item.get('content', []) if part.get('type') == 'output_text')
-        result = json.loads(output)
-        usage = data.get('usage', {})
+        usage = data.get('usage') or {}
+        logger.info('AI_SHADOW_RESPONSE | update=%s | response_status=%s | output_items=%s | text_chars=%s | output_tokens=%s | NO_ACTION',
+                    update_id, data.get('status', 'unknown'), len(data.get('output') or []),
+                    len(output), usage.get('output_tokens'))
+        if not output.strip():
+            logger.warning('AI_SHADOW_EMPTY | update=%s | response_status=%s | incomplete_reason=%s | NO_ACTION',
+                           update_id, data.get('status', 'unknown'),
+                           (data.get('incomplete_details') or {}).get('reason', 'unknown'))
+            return
+        cleaned = output.strip()
+        if cleaned.startswith('```'):
+            cleaned = re.sub(r'^```(?:json)?\s*|\s*```$', '', cleaned, flags=re.I).strip()
+        try:
+            result = json.loads(cleaned)
+        except json.JSONDecodeError:
+            logger.warning('AI_SHADOW_JSON_INVALID | update=%s | text_chars=%s | response_status=%s | NO_ACTION',
+                           update_id, len(output), data.get('status', 'unknown'))
+            return
+        if not isinstance(result, dict) or not isinstance(result.get('spam'), bool):
+            logger.warning('AI_SHADOW_SCHEMA_INVALID | update=%s | NO_ACTION', update_id)
+            return
         logger.info('AI_SHADOW | update=%s | spam=%s | confidence=%s | reason=%s | input_tokens=%s | output_tokens=%s | NO_ACTION',
                     update_id, result.get('spam'), result.get('confidence'),
                     str(result.get('reason', ''))[:140], usage.get('input_tokens'), usage.get('output_tokens'))
