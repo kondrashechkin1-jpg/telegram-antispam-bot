@@ -39,8 +39,9 @@ MUTE_HOURS = 24
 VIOLATION_RESET_DAYS = 14
 HISTORY_RETENTION_DAYS = 30
 
-# AI shadow mode: observes decisions but NEVER moderates or posts messages.
+# AI moderation is enabled explicitly; DRY_RUN still prevents all actions.
 AI_SHADOW_ENABLED = os.getenv('AI_SHADOW_ENABLED', 'false').lower() == 'true'
+AI_MODERATION_ENABLED = os.getenv('AI_MODERATION_ENABLED', 'false').lower() == 'true'
 OPENAI_API_KEY = os.getenv('OPENAI_API_KEY', '').strip().strip('\"').strip("'")
 AI_MODEL = 'gpt-5-nano'
 # Strict request-count safeguard plus conservative per-request cost reservation.
@@ -52,7 +53,7 @@ AI_RESERVE_USD_PER_REQUEST = 0.005
 AI_MAX_BODY_CHARS = 1600
 
 # Diagnostics only. No extra getUpdates calls and no message text/token logging.
-DIAG_BUILD = 'quote-forward-shadow-2026-10-25-02'
+DIAG_BUILD = 'quote-forward-live-2026-10-25-03'
 DIAG_INSTANCE = uuid.uuid4().hex[:8]
 DIAG_STARTED = time.monotonic()
 DIAG_STATE = {'poll_ok': 0, 'poll_errors': 0, 'received': 0, 'conflicts': 0}
@@ -177,8 +178,8 @@ def build_message_context(message, body):
 
 async def ai_shadow_check(message, body, update_id, app):
     # Independent fail-open observer.
-    if not AI_SHADOW_ENABLED or not OPENAI_API_KEY:
-        return
+    if not (AI_SHADOW_ENABLED or AI_MODERATION_ENABLED) or not OPENAI_API_KEY:
+        return None
     pool = app.bot_data['db']
     # Serialize budget reservations across concurrent handlers AND deployments via DB.
     month = datetime.now(timezone.utc).strftime('%Y-%m')
@@ -278,7 +279,7 @@ async def ai_shadow_check(message, body, update_id, app):
             or not isinstance(result.get('reason'), str)):
             logger.warning('AI_SHADOW_SCHEMA_INVALID | update=%s | NO_ACTION', update_id)
             return
-        # Advisory only: NEVER delete, warn, mute, ban or count violations here.
+        # The caller decides whether to moderate. No action occurs inside this function.
         logger.info('AI_QUOTE_SHADOW | update=%s | message_spam=%s | quoted_spam=%s | '
                     'intentional_promotion=%s | visible_quote=%s | external_reply=%s | '
                     'forwarded=%s | confidence=%s | reason=%s | input_tokens=%s | '
@@ -288,6 +289,7 @@ async def ai_shadow_check(message, body, update_id, app):
                     context_data['has_external_reply'], context_data['is_forwarded'],
                     result['confidence'], result['reason'][:140],
                     usage.get('input_tokens'), usage.get('output_tokens'))
+        return result, context_data
     except httpx.HTTPStatusError as exc:
         # Log only safe structured fields, never response text, headers, or secrets.
         status = exc.response.status_code
@@ -624,14 +626,46 @@ async def check_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             ''', chat.id, user.id)
         score, obvious_ad, old, reasons = assess(message, body, record)
         suspicious = old or score >= 5 or obvious_ad
-        # Shadow analysis runs for every non-admin text message, regardless of old score.
-        # Do not block existing moderation on an external API request.
-        if AI_SHADOW_ENABLED and OPENAI_API_KEY:
+        # Single AI call. When AI is enabled for moderation, use its verdict
+        # instead of independently applying the heuristic to the same message.
+        ai_result = None
+        ai_context = None
+        if AI_MODERATION_ENABLED and OPENAI_API_KEY:
+            ai_verdict = await ai_shadow_check(message, body, update.update_id, context.application)
+            if ai_verdict:
+                ai_result, ai_context = ai_verdict
+        elif AI_SHADOW_ENABLED and OPENAI_API_KEY:
             context.application.create_task(
                 ai_shadow_check(message, body, update.update_id, context.application),
                 update=update)
-        logger.info('DIAG_DECISION | instance=%s | update=%s | score=%s | suspicious=%s | %s',
-                    DIAG_INSTANCE, update.update_id, score, suspicious, reasons)
+
+        quote_only = False
+        source = 'heuristic'
+        if ai_result is not None:
+            source = 'ai'
+            # Forwarded advertising is published message content.
+            # An ordinary reply preview alone is NOT a visible advertising quote.
+            own_spam = ai_result['message_spam']
+            quote_spam = (bool(ai_context['visible_quote']) and ai_result['quoted_spam'])
+            promoted_quote = quote_spam and ai_result['intentional_promotion']
+            suspicious = own_spam or promoted_quote
+            quote_only = quote_spam and not suspicious
+            reasons = ('ai: ' + ai_result['reason'])[:500]
+        logger.info('DIAG_DECISION | instance=%s | update=%s | score=%s | suspicious=%s | '
+                    'quote_only=%s | source=%s | %s',
+                    DIAG_INSTANCE, update.update_id, score, suspicious, quote_only, source, reasons)
+        if quote_only:
+            if DRY_RUN:
+                logger.warning('AI_QUOTE_SIMULATION | update=%s | user=%s | would_delete=1 | '
+                               'violation=0 | NO_ACTION', update.update_id, user.id)
+            else:
+                try:
+                    await message.delete()
+                    logger.info('AI_QUOTE_DELETED | update=%s | user=%s | violation=0',
+                                update.update_id, user.id)
+                except Exception:
+                    logger.exception('Failed to delete quote-only message %s', message.message_id)
+            return
         if not suspicious:
             logger.info('DIAG_SKIP | instance=%s | update=%s | reason=not_spam',
                         DIAG_INSTANCE, update.update_id)
@@ -710,7 +744,7 @@ async def check_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                      violation_type, decision_source, action, occurred_at, expires_at)
                     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)''',
                     chat.id, user.id, message.message_id, body[:1600], reasons,
-                    'advertising_suspected', 'heuristic', action, now, expires_at)
+                    'advertising_suspected', source, action, now, expires_at)
         logger.info('Deleted | user=%s | violations=%s | newcomer=%s | action=%s',
                     user.id, violations, locked_newcomer, action)
         if is_admin:
@@ -749,8 +783,8 @@ def main():
     app.add_handler(MessageHandler(filters.ChatType.GROUPS & filters.StatusUpdate.NEW_CHAT_MEMBERS, service_join))
     app.add_handler(MessageHandler(filters.ChatType.GROUPS & (filters.TEXT | filters.CAPTION) & ~filters.COMMAND,
                                    check_message))
-    logger.info('AI_SHADOW_CONFIG | enabled=%s | key_present=%s | model=%s | monthly_request_cap=%s',
-                AI_SHADOW_ENABLED, bool(OPENAI_API_KEY), AI_MODEL, AI_MAX_REQUESTS_MONTH)
+    logger.info('AI_CONFIG | shadow=%s | moderation=%s | key_present=%s | model=%s | monthly_request_cap=%s',
+                AI_SHADOW_ENABLED, AI_MODERATION_ENABLED, bool(OPENAI_API_KEY), AI_MODEL, AI_MAX_REQUESTS_MONTH)
     logger.info('Starting | chat=%s | DRY_RUN=%s | newcomer=%sh | mute=%sh | force_regular=%s | test_user=%s | test_chat=%s',
                 ALLOWED_CHAT_ID, DRY_RUN, NEWCOMER_HOURS, MUTE_HOURS,
                 TEST_FORCE_REGULAR, TEST_FORCE_REGULAR_USER_ID, TEST_FORCE_REGULAR_CHAT_ID)
