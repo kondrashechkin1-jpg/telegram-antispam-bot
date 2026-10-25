@@ -53,7 +53,7 @@ AI_RESERVE_USD_PER_REQUEST = 0.005
 AI_MAX_BODY_CHARS = 1600
 
 # Diagnostics only. No extra getUpdates calls and no message text/token logging.
-DIAG_BUILD = 'profile-cta-2026-10-25-05'
+DIAG_BUILD = 'quote-intent-2026-10-25-06'
 DIAG_INSTANCE = uuid.uuid4().hex[:8]
 DIAG_STARTED = time.monotonic()
 DIAG_STATE = {'poll_ok': 0, 'poll_errors': 0, 'received': 0, 'conflicts': 0}
@@ -230,8 +230,12 @@ async def ai_shadow_check(message, body, update_id, app):
             "Если visible_quote пуст, quoted_spam=false, даже если reply_preview "
             "или external_reply_preview рекламный. "
             "intentional_promotion: есть ли убедительные признаки, что автор сам "
-            "намеренно распространяет или одобряет рекламу? Учитывай текст автора "
-            "в контексте цитаты, но не приписывай ему слова цитируемого сообщения. "
+            "намеренно распространяет, рекомендует, одобряет или помогает продвигать рекламу? "
+            "Для видимой рекламной цитаты (visible_quote) похвала, рекомендация, согласие, "
+            "призыв воспользоваться предложением или нейтрально-положительное сопровождение "
+            "могут означать intentional_promotion=true. Жалоба на спам, критика, предупреждение "
+            "других участников или вопрос без продвижения означают intentional_promotion=false. "
+            "Учитывай текст автора в контексте цитаты, но не приписывай ему слова цитируемого сообщения. "
             "reply_preview и external_reply_preview являются контекстом и не доказывают, "
             "что этот текст виден в опубликованном ответе. "
             "forward_origin_type и сам факт пересылки не доказывают рекламу. "
@@ -702,10 +706,20 @@ async def check_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 # Forwarded advertising is published message content.
                 # An ordinary reply preview alone is NOT a visible advertising quote.
                 own_spam = ai_result['message_spam']
-                quote_spam = (bool(ai_context['visible_quote']) and ai_result['quoted_spam'])
-                promoted_quote = quote_spam and ai_result['intentional_promotion']
+                visible_quote = bool(ai_context['visible_quote'])
+                quote_spam = visible_quote and ai_result['quoted_spam']
+                # Intent is the decisive guard for a visible quote. This deliberately
+                # survives a contradictory quoted_spam=False result when the model has
+                # already concluded that the author is intentionally promoting it.
+                promoted_quote = visible_quote and ai_result['intentional_promotion']
                 suspicious = own_spam or promoted_quote
-                quote_only = quote_spam and not suspicious
+                # A visible advertising quote used for criticism/reporting is removed
+                # from the chat, but does not count as a violation.
+                quote_only = quote_spam and not own_spam and not ai_result['intentional_promotion']
+                if visible_quote and ai_result['intentional_promotion'] and not ai_result['quoted_spam']:
+                    logger.warning('AI_QUOTE_INCONSISTENT | update=%s | quoted_spam=False | '
+                                   'intentional_promotion=True | treating_as_promoted_quote=True',
+                                   update.update_id)
                 reasons = ('ai: ' + ai_result['reason'])[:500]
         logger.info('DIAG_DECISION | instance=%s | update=%s | score=%s | suspicious=%s | '
                     'quote_only=%s | source=%s | %s',
