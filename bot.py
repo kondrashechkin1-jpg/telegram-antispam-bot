@@ -53,7 +53,7 @@ AI_RESERVE_USD_PER_REQUEST = 0.005
 AI_MAX_BODY_CHARS = 1600
 
 # Diagnostics only. No extra getUpdates calls and no message text/token logging.
-DIAG_BUILD = 'quote-forward-live-2026-10-25-03'
+DIAG_BUILD = 'external-reply-guard-2026-10-25-04'
 DIAG_INSTANCE = uuid.uuid4().hex[:8]
 DIAG_STARTED = time.monotonic()
 DIAG_STATE = {'poll_ok': 0, 'poll_errors': 0, 'received': 0, 'conflicts': 0}
@@ -537,7 +537,7 @@ def active_regular_violations(record, now):
 
 def action_for(violations, newcomer):
     if newcomer:
-        return 'delete_and_ban' if violations >= 2 else 'delete_and_warn_new'
+        return 'delete_and_ban' if violations >= 2 else 'delete_only_new'
     if violations == 1:
         return 'delete_and_warn_regular_first'
     if violations == 2:
@@ -551,10 +551,10 @@ def user_mention(user):
 
 
 def notice_for(action, mention):
-    if action == 'delete_and_warn_new':
-        return f'Поймал за рекламой {mention}. Пока почистил за ним следы, но в следующий раз накажу 😎'
-    if action == 'delete_and_ban':
-        return f'Доигрался, дружок. {mention} наказан удалением за рекламу. Так обидно, я думал, он норм 🥹'
+    # Newcomer moderation is intentionally silent: delete on first violation,
+    # delete + ban on the second, without chat notices.
+    if action == 'delete_external_reply_unseen':
+        return f'{mention}, удалил твое сообщение, возможно это реклама.'
     if action == 'delete_and_warn_regular_first':
         return f'Поймал за рекламой {mention}. Сообщение удалено, это первое предупреждение.'
     if action == 'delete_and_warn_regular':
@@ -622,31 +622,69 @@ async def check_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             ''', chat.id, user.id)
         score, obvious_ad, old, reasons = assess(message, body, record)
         suspicious = old or score >= 5 or obvious_ad
+        newcomer = effective_newcomer(record, chat.id, user.id)
+        message_context = build_message_context(message, body)
+        external_unseen = (message_context['has_external_reply']
+                           and not bool(message_context['visible_quote']))
+
+        # Telegram can show an external-reply preview to users without exposing its
+        # text to the Bot API. For regular members, remove such messages without a
+        # violation and explain why. Newcomers keep the normal violation ladder.
+        if external_unseen and not newcomer:
+            logger.info('DIAG_DECISION | instance=%s | update=%s | score=%s | suspicious=%s | '
+                        'quote_only=False | source=external_reply_guard | '
+                        'external_reply_unseen=True | regular_no_violation=True',
+                        DIAG_INSTANCE, update.update_id, score, False)
+            if DRY_RUN:
+                logger.warning('EXTERNAL_REPLY_SIMULATION | update=%s | user=%s | '
+                               'would_delete=1 | violation=0 | would_notice=1 | NO_ACTION',
+                               update.update_id, user.id)
+                return
+            try:
+                await message.delete()
+            except Exception:
+                logger.exception('Failed to delete unseen external reply %s', message.message_id)
+                return
+            logger.info('EXTERNAL_REPLY_DELETED | update=%s | user=%s | violation=0',
+                        update.update_id, user.id)
+            if is_admin:
+                logger.info('Admin test: external reply deletion only, no notice')
+                return
+            await send_notice(context, chat.id, user, 'delete_external_reply_unseen')
+            return
+
         # Single AI call. When AI is enabled for moderation, use its verdict
         # instead of independently applying the heuristic to the same message.
         ai_result = None
         ai_context = None
-        if AI_MODERATION_ENABLED and OPENAI_API_KEY:
-            ai_verdict = await ai_shadow_check(message, body, update.update_id, context.application)
-            if ai_verdict:
-                ai_result, ai_context = ai_verdict
-        elif AI_SHADOW_ENABLED and OPENAI_API_KEY:
-            context.application.create_task(
-                ai_shadow_check(message, body, update.update_id, context.application),
-                update=update)
-
         quote_only = False
         source = 'heuristic'
-        if ai_result is not None:
-            source = 'ai'
-            # Forwarded advertising is published message content.
-            # An ordinary reply preview alone is NOT a visible advertising quote.
-            own_spam = ai_result['message_spam']
-            quote_spam = (bool(ai_context['visible_quote']) and ai_result['quoted_spam'])
-            promoted_quote = quote_spam and ai_result['intentional_promotion']
-            suspicious = own_spam or promoted_quote
-            quote_only = quote_spam and not suspicious
-            reasons = ('ai: ' + ai_result['reason'])[:500]
+        if external_unseen and newcomer:
+            # The hidden external content cannot be inspected, so newcomers are
+            # handled by the standard first/second-violation policy without AI.
+            suspicious = True
+            source = 'external_reply_guard'
+            reasons = 'external_reply_unseen=True; newcomer_policy=standard_violation'
+        else:
+            if AI_MODERATION_ENABLED and OPENAI_API_KEY:
+                ai_verdict = await ai_shadow_check(message, body, update.update_id, context.application)
+                if ai_verdict:
+                    ai_result, ai_context = ai_verdict
+            elif AI_SHADOW_ENABLED and OPENAI_API_KEY:
+                context.application.create_task(
+                    ai_shadow_check(message, body, update.update_id, context.application),
+                    update=update)
+
+            if ai_result is not None:
+                source = 'ai'
+                # Forwarded advertising is published message content.
+                # An ordinary reply preview alone is NOT a visible advertising quote.
+                own_spam = ai_result['message_spam']
+                quote_spam = (bool(ai_context['visible_quote']) and ai_result['quoted_spam'])
+                promoted_quote = quote_spam and ai_result['intentional_promotion']
+                suspicious = own_spam or promoted_quote
+                quote_only = quote_spam and not suspicious
+                reasons = ('ai: ' + ai_result['reason'])[:500]
         logger.info('DIAG_DECISION | instance=%s | update=%s | score=%s | suspicious=%s | '
                     'quote_only=%s | source=%s | %s',
                     DIAG_INSTANCE, update.update_id, score, suspicious, quote_only, source, reasons)
@@ -666,7 +704,6 @@ async def check_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             logger.info('DIAG_SKIP | instance=%s | update=%s | reason=not_spam',
                         DIAG_INSTANCE, update.update_id)
             return
-        newcomer = effective_newcomer(record, chat.id, user.id)
         next_violations = ((record['newcomer_violations'] if newcomer else
                             active_regular_violations(record, datetime.now(timezone.utc))) + 1)
         proposed_action = action_for(next_violations, newcomer)
