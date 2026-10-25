@@ -53,7 +53,7 @@ AI_RESERVE_USD_PER_REQUEST = 0.005
 AI_MAX_BODY_CHARS = 1600
 
 # Diagnostics only. No extra getUpdates calls and no message text/token logging.
-DIAG_BUILD = 'quote-intent-2026-10-25-06'
+DIAG_BUILD = 'intent-guard-2026-10-25-07'
 DIAG_INSTANCE = uuid.uuid4().hex[:8]
 DIAG_STARTED = time.monotonic()
 DIAG_STATE = {'poll_ok': 0, 'poll_errors': 0, 'received': 0, 'conflicts': 0}
@@ -705,7 +705,12 @@ async def check_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 source = 'ai'
                 # Forwarded advertising is published message content.
                 # An ordinary reply preview alone is NOT a visible advertising quote.
-                own_spam = ai_result['message_spam']
+                # For the user's own text, require both a spam classification and
+                # promotional intent. This prevents contradictory model outputs such as
+                # message_spam=True + intentional_promotion=False from deleting normal
+                # complaints or discussions about spam.
+                own_spam = (ai_result['message_spam']
+                            and ai_result['intentional_promotion'])
                 visible_quote = bool(ai_context['visible_quote'])
                 quote_spam = visible_quote and ai_result['quoted_spam']
                 # Intent is the decisive guard for a visible quote. This deliberately
@@ -716,6 +721,10 @@ async def check_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 # A visible advertising quote used for criticism/reporting is removed
                 # from the chat, but does not count as a violation.
                 quote_only = quote_spam and not own_spam and not ai_result['intentional_promotion']
+                if ai_result['message_spam'] and not ai_result['intentional_promotion']:
+                    logger.warning('AI_MESSAGE_INCONSISTENT | update=%s | message_spam=True | '
+                                   'intentional_promotion=False | treating_own_text_as_spam=False',
+                                   update.update_id)
                 if visible_quote and ai_result['intentional_promotion'] and not ai_result['quoted_spam']:
                     logger.warning('AI_QUOTE_INCONSISTENT | update=%s | quoted_spam=False | '
                                    'intentional_promotion=True | treating_as_promoted_quote=True',
