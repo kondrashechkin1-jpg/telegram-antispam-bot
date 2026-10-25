@@ -443,11 +443,7 @@ async def save_join(chat_id, user_id, joined_at, pool):
             INSERT INTO group_members (chat_id, user_id, joined_at)
             VALUES ($1, $2, $3)
             ON CONFLICT (chat_id, user_id) DO UPDATE SET
-                joined_at=EXCLUDED.joined_at,
-                violations=0,
-                newcomer_violations=0,
-                first_violation_newcomer=NULL,
-                last_violation_at=NULL
+                joined_at=COALESCE(group_members.joined_at, EXCLUDED.joined_at)
         ''', chat_id, user_id, joined_at)
     logger.info('Member joined | user=%s', user_id)
 
